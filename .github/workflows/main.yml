@@ -1,0 +1,187 @@
+name: main
+
+on:
+  push:
+    branches: [main]
+
+env:
+  MVN: mvn --batch-mode --no-transfer-progress
+  TEST_URL: https://booking-test.internal
+  PROD_URL: https://booking.internal
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+      - run: $MVN clean package -DskipTests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jar
+          path: target/*.jar
+          retention-days: 1
+
+  unit:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+      - run: $MVN test -Dgroups=unit -Dsurefire.shard=${{ matrix.shard }}/2
+
+  integration-full:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+      - run: $MVN verify -Dgroups=integration -Dsurefire.shard=${{ matrix.shard }}/5
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-reports-${{ matrix.shard }}
+          path: target/failsafe-reports/
+
+  docker:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: jar
+          path: target/
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+  deploy-test:
+    needs: [integration-full, docker]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: test-stand
+      cancel-in-progress: false
+    environment:
+      name: test
+      url: https://booking-test.internal
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./migrate.sh test
+      - run: ./deploy.sh test ${{ github.sha }}
+      - run: ./wait-healthy.sh $TEST_URL
+
+  api-full:
+    needs: deploy-test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: test-stand
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+      - run: $MVN verify -Dgroups=api -Dapi.url=$TEST_URL
+
+  e2e-stable:
+    needs: api-full
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: test-stand
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+      - run: $MVN verify -Dgroups=e2e -DexcludedGroups=quarantine -Dapi.url=$TEST_URL
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-logs
+          path: target/e2e-logs/
+
+  e2e-quarantine:
+    needs: e2e-stable
+    runs-on: ubuntu-latest
+    concurrency:
+      group: test-stand
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+      - uses: nick-fields/retry@v3
+        with:
+          max_attempts: 2
+          timeout_minutes: 20
+          command: $MVN verify -Dgroups=quarantine -Dapi.url=$TEST_URL
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quarantine-logs
+          path: target/e2e-logs/
+
+  deploy-prod:
+    needs: [api-full, e2e-stable, e2e-quarantine]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: https://booking.internal
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./migrate.sh prod
+      - run: ./deploy.sh prod ${{ github.sha }}
+
+  smoke-prod:
+    needs: deploy-prod
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+      - run: $MVN verify -Dgroups=api -Dtags=smoke -Dapi.url=$PROD_URL
